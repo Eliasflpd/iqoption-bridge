@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from iqoptionapi.stable_api import IQ_Option
+from iqoptionapi import IQ_Option
 import os, time, threading, asyncio, logging
 
 logging.basicConfig(level=logging.INFO)
