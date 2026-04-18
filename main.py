@@ -1,6 +1,5 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
 from iqoptionapi.api import IQOptionAPI
 from pydantic import BaseModel
 from typing import Optional
@@ -24,6 +23,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 iq: IQOptionAPI = None
 connected = False
 connect_lock = threading.Lock()
+_iq_disconnected_since: float = 0.0   # timestamp da primeira queda
 
 # ---------------------------------------------------------------------------
 # Arquivo de sinais (JSONL local)
@@ -121,11 +121,53 @@ def update_signal_result(res: SignalResult) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
+
+def send_telegram(text: str, parse_mode: str = "HTML") -> bool:
+    """Envia mensagem via Telegram. Fail-open se env vars ausentes."""
+    token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        logger.warning("Telegram nao configurado (faltam TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
+        return False
+    try:
+        url  = f"https://api.telegram.org/bot{token}/sendMessage"
+        resp = req_lib.post(url, json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }, timeout=5)
+        return resp.status_code == 200
+    except Exception as e:
+        logger.error(f"Erro Telegram: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Alertas com cooldown (nao repetir o mesmo alerta em menos de N segundos)
+# ---------------------------------------------------------------------------
+
+_alert_cooldown: dict = {}   # {alert_key: timestamp_ultimo_envio}
+
+
+def alert_once(key: str, message: str, cooldown_sec: int = 3600) -> bool:
+    now = time.time()
+    if key in _alert_cooldown and (now - _alert_cooldown[key]) < cooldown_sec:
+        return False
+    ok = send_telegram(message)
+    if ok:
+        _alert_cooldown[key] = now
+    return ok
+
+
+# ---------------------------------------------------------------------------
 # IQ Option — conexao
 # ---------------------------------------------------------------------------
 
 def do_connect():
-    global iq, connected
+    global iq, connected, _iq_disconnected_since
     email    = os.getenv("IQOPTION_EMAIL", "")
     password = os.getenv("IQOPTION_PASSWORD", "")
     if not email or not password:
@@ -138,13 +180,18 @@ def do_connect():
         if check:
             iq.change_balance("PRACTICE")
             connected = True
+            _iq_disconnected_since = 0.0
             logger.info("IQ Option conectado (PRACTICE)")
             return True, "ok"
         else:
+            if connected:
+                _iq_disconnected_since = time.time()
             connected = False
             logger.error(f"Falha na conexao: {reason}")
             return False, str(reason)
     except Exception as e:
+        if connected:
+            _iq_disconnected_since = time.time()
         connected = False
         logger.error(f"Excecao na conexao: {e}")
         return False, str(e)
@@ -158,10 +205,12 @@ def startup():
 def keepalive():
     while True:
         time.sleep(90)
-        global connected
+        global connected, _iq_disconnected_since
         if iq:
             try:
                 if not iq.check_connect():
+                    if connected:
+                        _iq_disconnected_since = time.time()
                     connected = False
                     do_connect()
             except:
@@ -230,11 +279,8 @@ def is_killzone_active() -> tuple:
     ny_tz = pytz.timezone('America/New_York')
     now_ny = datetime.now(ny_tz)
     total_min = now_ny.hour * 60 + now_ny.minute
-
-    # Dead zone — NY Lunch: bloquear explicitamente
     if 11*60+30 <= total_min < 13*60:
         return False, "NY Lunch (DEAD ZONE)"
-
     zones = {
         "London Open":   (2*60, 5*60),
         "NY Overlap":    (7*60, 10*60),
@@ -243,7 +289,6 @@ def is_killzone_active() -> tuple:
     for name, (start, end) in zones.items():
         if start <= total_min < end:
             return True, name
-
     return False, "Fora de Killzone"
 
 
@@ -254,7 +299,6 @@ def is_killzone_active() -> tuple:
 _news_cache = {"data": None, "fetched_at": 0}
 
 def fetch_news():
-    """Busca eventos economicos do Finnhub com cache de 15 min."""
     now = time.time()
     if _news_cache["data"] is not None and (now - _news_cache["fetched_at"] < 900):
         return _news_cache["data"]
@@ -276,16 +320,10 @@ def fetch_news():
         return _news_cache.get("data") or []
 
 def has_high_impact_news(before_min: int = 30, after_min: int = 15) -> tuple:
-    """
-    Retorna (True, descricao) se houver news HIGH em GBP ou USD
-    dentro da janela: -after_min ... +before_min em relacao ao horario atual (UTC).
-    Fail-open: se FINNHUB_API_KEY ausente, retorna (False, '').
-    """
     events = fetch_news()
     now = datetime.utcnow()
     window_start = now - timedelta(minutes=after_min)
     window_end   = now + timedelta(minutes=before_min)
-
     for ev in events:
         if ev.get("impact", "").lower() != "high":
             continue
@@ -298,44 +336,203 @@ def has_high_impact_news(before_min: int = 30, after_min: int = 15) -> tuple:
         if window_start <= ev_time <= window_end:
             desc = f"{ev.get('event','?')} ({ev.get('country')}) @ {ev_time.strftime('%H:%M')} UTC"
             return True, desc
-
     return False, ""
 
 
 # ---------------------------------------------------------------------------
-# Filtro #3 — Volatilidade real via ATR (substitui volume OTC/proxy)
+# Filtro #3 — Volatilidade real via ATR
 # ---------------------------------------------------------------------------
 
 def volatility_ok(raw: list, multiplier: float = 1.2, period: int = 14) -> tuple:
-    """
-    Retorna (ok: bool, atr_ratio: float).
-    ATR atual > multiplier * ATR_medio(period) = volatilidade suficiente.
-    Substitui o filtro de volume (que e proxy/zerado em forex OTC).
-    """
     if len(raw) < period + 1:
         return False, 0.0
     highs  = [c["max"]   for c in raw]
     lows   = [c["min"]   for c in raw]
     closes = [c["close"] for c in raw]
-
     trs = []
     for i in range(1, len(raw)):
-        hl  = highs[i]  - lows[i]
-        hc  = abs(highs[i]  - closes[i-1])
-        lc  = abs(lows[i]   - closes[i-1])
+        hl = highs[i] - lows[i]
+        hc = abs(highs[i] - closes[i-1])
+        lc = abs(lows[i]  - closes[i-1])
         trs.append(max(hl, hc, lc))
-
     if len(trs) < period:
         return False, 0.0
-
-    avg_atr = sum(trs[-period:]) / period
+    avg_atr    = sum(trs[-period:]) / period
     current_tr = trs[-1]
-
     if avg_atr == 0:
         return False, 0.0
-
     ratio = current_tr / avg_atr
     return ratio >= multiplier, round(ratio, 4)
+
+
+# ---------------------------------------------------------------------------
+# Confluencia 4/8 — inferencia de direcao + score
+# ---------------------------------------------------------------------------
+
+_CALL_PATTERNS = {"Martelo (alta)", "Engolfo de Alta", "Pin Bar Alta"}
+_PUT_PATTERNS  = {"Shooting Star (baixa)", "Engolfo de Baixa", "Pin Bar Baixa"}
+
+def infer_direction(pattern: str) -> Optional[str]:
+    if pattern in _CALL_PATTERNS: return "CALL"
+    if pattern in _PUT_PATTERNS:  return "PUT"
+    return None
+
+def calc_confluence(pattern: str, vol_ok: bool, atr_ratio: float,
+                    rsi: Optional[float], ema9: Optional[float],
+                    ema21: Optional[float], lc: float,
+                    boll: Optional[dict], trend: str,
+                    kz_zone: str) -> dict:
+    """
+    Retorna dict com direction, filters_matched, score, valid.
+    4/8 = pattern(obrigatorio) + atr(obrigatorio) + 2 de 6 opcionais.
+    """
+    direction = infer_direction(pattern)
+    if direction is None:
+        return {"valid": False, "direction": None, "score": 0, "filters_matched": {}}
+
+    fm = {}
+    # Obrigatorios
+    fm["pattern"] = pattern not in ("Sem padrao claro", "Sem dados", "Doji") and direction is not None
+    fm["atr"]     = vol_ok
+
+    # Opcionais (precisa >= 2)
+    fm["rsi_extremo"] = rsi is not None and (rsi < 30 or rsi > 70)
+
+    if ema9 and ema21:
+        if direction == "CALL":
+            fm["ema_aligned"] = lc > ema9 > ema21
+        else:
+            fm["ema_aligned"] = lc < ema9 < ema21
+    else:
+        fm["ema_aligned"] = False
+
+    if direction == "CALL":
+        fm["trend_match"] = trend == "alta"
+    else:
+        fm["trend_match"] = trend == "baixa"
+
+    if boll:
+        rng = boll["upper"] - boll["lower"]
+        if rng > 0:
+            pct_b = (lc - boll["lower"]) / rng * 100
+            if direction == "CALL":
+                fm["bollinger_breakout"] = pct_b < 5
+            else:
+                fm["bollinger_breakout"] = pct_b > 95
+        else:
+            fm["bollinger_breakout"] = False
+    else:
+        fm["bollinger_breakout"] = False
+
+    fm["killzone_strong"] = kz_zone in ("NY Overlap", "Silver Bullet")
+    fm["squeeze_break"]   = False   # placeholder — requer historico de bandwidth
+
+    optional_keys = ["rsi_extremo","ema_aligned","trend_match","bollinger_breakout","killzone_strong","squeeze_break"]
+    optional_hits = sum(1 for k in optional_keys if fm.get(k))
+    score = 2 + optional_hits   # 2 obrigatorios + N opcionais
+
+    valid = fm["pattern"] and fm["atr"] and optional_hits >= 2
+
+    return {"valid": valid, "direction": direction, "score": score, "filters_matched": fm}
+
+
+# ---------------------------------------------------------------------------
+# Workers de background
+# ---------------------------------------------------------------------------
+
+def monitor_worker():
+    """Roda a cada 60s: verifica losses, pendentes expirados e conexao."""
+    while True:
+        time.sleep(60)
+        try:
+            # 1. Conexao perdida por mais de 2 min
+            global _iq_disconnected_since
+            if not connected and _iq_disconnected_since > 0:
+                down_sec = time.time() - _iq_disconnected_since
+                if down_sec > 120:
+                    alert_once("disconnected",
+                               "🚨 <b>IQ Option desconectado</b>\nBot tentando reconectar.",
+                               cooldown_sec=1800)
+
+            # 2. Losses seguidos
+            signals = read_all_signals()
+            recent = [s for s in signals if s["result"] in ("WIN","LOSS")][-10:]
+            loss_streak = 0
+            for s in reversed(recent):
+                if s["result"] == "LOSS":
+                    loss_streak += 1
+                else:
+                    break
+            if loss_streak >= 5:
+                alert_once("losses_5",
+                           f"🚨🚨 <b>{loss_streak} LOSSES SEGUIDOS</b>\nPARE AGORA e investigue o que mudou.")
+            elif loss_streak >= 3:
+                alert_once("losses_3",
+                           f"⚠️ <b>{loss_streak} losses seguidos</b>\nConsidere pausar e revisar.")
+
+            # 3. Pendentes expirados ha +5min → marca DOE automaticamente
+            now_dt = datetime.now(timezone.utc)
+            cutoff  = now_dt - timedelta(minutes=5)
+            updated = False
+            for s in signals:
+                if s["result"] == "PENDING":
+                    exp = datetime.fromisoformat(s["expires_at"].replace("Z","+00:00"))
+                    if exp < cutoff:
+                        s["result"]   = "DOE"
+                        s["closed_at"] = nowiso()
+                        s["notes"]    = "Auto-marked DOE (expired without result update)"
+                        updated = True
+            if updated:
+                with SIGNALS_FILE.open("w") as f:
+                    for s in signals:
+                        f.write(json.dumps(s) + "\n")
+                logger.warning("Sinais pendentes expirados marcados como DOE")
+
+        except Exception as e:
+            logger.error(f"Erro monitor_worker: {e}")
+
+threading.Thread(target=monitor_worker, daemon=True).start()
+
+
+def daily_summary_worker():
+    """Envia resumo diario as 22h horario de Brasilia."""
+    sent_today = None
+    while True:
+        time.sleep(60)
+        try:
+            br = pytz.timezone('America/Sao_Paulo')
+            now_br = datetime.now(br)
+            if now_br.hour == 22 and now_br.minute < 5:
+                today_key = now_br.strftime("%Y-%m-%d")
+                if sent_today == today_key:
+                    continue
+                stats = api_stats(days=1)
+                if stats["total_closed"] == 0:
+                    sent_today = today_key   # nao repete no mesmo dia mesmo sem trades
+                    continue
+                zones_text = "\n".join([
+                    f"• {z}: {d['wins']}W/{d['losses']}L ({d['win_rate']}%)"
+                    for z, d in stats["by_killzone"].items()
+                ]) or "Nenhuma zona registrada"
+                wr_icon = "✅" if stats["above_break_even"] else "⚠️"
+                msg = (
+                    f"📊 <b>RESUMO DIÁRIO — {now_br.strftime('%d/%m')}</b>\n"
+                    f"Total: {stats['total_closed']} trades\n"
+                    f"🟢 Wins: {stats['wins']}\n"
+                    f"🔴 Losses: {stats['losses']}\n"
+                    f"🟡 DOE: {stats['does']}\n"
+                    f"📈 Win rate: {stats['win_rate']}%\n"
+                    f"{wr_icon} {'Acima' if stats['above_break_even'] else 'Abaixo'} break-even (55.5%)\n\n"
+                    f"<b>Por killzone:</b>\n{zones_text}\n\n"
+                    f"<b>Maior streak de loss:</b> {stats['max_loss_streak']}"
+                )
+                if send_telegram(msg):
+                    sent_today = today_key
+        except Exception as e:
+            logger.error(f"Erro daily_summary_worker: {e}")
+
+threading.Thread(target=daily_summary_worker, daemon=True).start()
+
 
 
 # ---------------------------------------------------------------------------
@@ -344,17 +541,20 @@ def volatility_ok(raw: list, multiplier: float = 1.2, period: int = 14) -> tuple
 
 @app.get("/")
 def root():
+    tg_configured = bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
     return {
         "service": "IQ Option Bridge API v2",
         "connected": connected,
         "account": "PRACTICE",
+        "telegram_configured": tg_configured,
         "endpoints": [
             "/health", "/balance",
             "/candles/{asset}/{dur}/{qtd}",
             "/price/{asset}", "/payout/{asset}",
-            "/analyze/{asset}/{dur}",
+            "/analyze/{asset}/{dur}?auto_log=true",
             "/assets/open",
             "/killzone", "/news-check",
+            "/telegram/test",
             "/signal/log", "/signal/result",
             "/signals/recent", "/signals/export",
             "/stats"
@@ -363,121 +563,187 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok":True,"connected":connected,"account":"PRACTICE"}
+    return {"ok": True, "connected": connected, "account": "PRACTICE"}
 
 @app.get("/connect")
 def reconnect():
-    ok,reason = do_connect()
-    return {"connected":ok,"reason":str(reason)}
+    ok, reason = do_connect()
+    return {"connected": ok, "reason": str(reason)}
 
 @app.get("/balance")
 def balance():
     chk()
-    try: return {"balance":iq.get_balance(),"currency":iq.get_currency(),"account":"PRACTICE"}
-    except Exception as e: raise HTTPException(500,str(e))
+    try: return {"balance": iq.get_balance(), "currency": iq.get_currency(), "account": "PRACTICE"}
+    except Exception as e: raise HTTPException(500, str(e))
 
 @app.get("/candles/{asset}/{duracao_seg}/{quantidade}")
-def candles(asset:str, duracao_seg:int, quantidade:int=50):
+def candles(asset: str, duracao_seg: int, quantidade: int = 50):
     chk()
     try:
-        raw = iq.get_candles(asset, duracao_seg, min(quantidade,500), time.time())
-        if not raw: raise HTTPException(404,f"Sem dados para {asset}")
-        return {"asset":asset,"duracao_seg":duracao_seg,"total":len(raw),
-                "candles":[{"time":c["from"]*1000,"open":c["open"],"high":c["max"],"low":c["min"],"close":c["close"],"volume":c.get("volume",0)} for c in raw]}
+        raw = iq.get_candles(asset, duracao_seg, min(quantidade, 500), time.time())
+        if not raw: raise HTTPException(404, f"Sem dados para {asset}")
+        return {"asset": asset, "duracao_seg": duracao_seg, "total": len(raw),
+                "candles": [{"time": c["from"]*1000, "open": c["open"], "high": c["max"],
+                              "low": c["min"], "close": c["close"], "volume": c.get("volume", 0)} for c in raw]}
     except HTTPException: raise
-    except Exception as e: raise HTTPException(500,str(e))
+    except Exception as e: raise HTTPException(500, str(e))
 
 @app.get("/price/{asset}")
-def price(asset:str):
+def price(asset: str):
     chk()
     try:
-        raw = iq.get_candles(asset,60,1,time.time())
-        if not raw: raise HTTPException(404,f"Sem dados para {asset}")
-        return {"asset":asset,"price":raw[-1]["close"],"time":raw[-1]["from"]*1000}
+        raw = iq.get_candles(asset, 60, 1, time.time())
+        if not raw: raise HTTPException(404, f"Sem dados para {asset}")
+        return {"asset": asset, "price": raw[-1]["close"], "time": raw[-1]["from"]*1000}
     except HTTPException: raise
-    except Exception as e: raise HTTPException(500,str(e))
+    except Exception as e: raise HTTPException(500, str(e))
 
 @app.get("/payout/{asset}")
-def payout(asset:str):
+def payout(asset: str):
     chk()
     try:
-        a = iq.get_all_open_time().get("binary",{}).get(asset)
-        if not a: raise HTTPException(404,f"{asset} nao encontrado")
-        p = a.get("profit",{})
-        return {"asset":asset,"open":a.get("open",False),"payout_1min":p.get("1min",{}).get("value",0),"payout_5min":p.get("5min",{}).get("value",0)}
+        a = iq.get_all_open_time().get("binary", {}).get(asset)
+        if not a: raise HTTPException(404, f"{asset} nao encontrado")
+        p = a.get("profit", {})
+        return {"asset": asset, "open": a.get("open", False),
+                "payout_1min": p.get("1min", {}).get("value", 0),
+                "payout_5min": p.get("5min", {}).get("value", 0)}
     except HTTPException: raise
-    except Exception as e: raise HTTPException(500,str(e))
+    except Exception as e: raise HTTPException(500, str(e))
 
 @app.get("/assets/open")
 def open_assets():
     chk()
     try:
         all_a = iq.get_all_open_time()
-        return {"binary":sorted(k for k,v in all_a.get("binary",{}).items() if v.get("open")),
-                "digital":sorted(k for k,v in all_a.get("digital",{}).items() if v.get("open"))}
-    except Exception as e: raise HTTPException(500,str(e))
+        return {
+            "binary":  sorted(k for k, v in all_a.get("binary",  {}).items() if v.get("open")),
+            "digital": sorted(k for k, v in all_a.get("digital", {}).items() if v.get("open"))
+        }
+    except Exception as e: raise HTTPException(500, str(e))
 
 @app.get("/killzone")
 def killzone_status():
-    """Retorna o status atual da killzone ICT."""
     active, zone = is_killzone_active()
     return {"active": active, "zone": zone}
 
 @app.get("/news-check")
 def news_check():
-    """Verifica se ha news de alto impacto em GBP/USD proximas."""
     blocked, desc = has_high_impact_news()
     return {"blocked": blocked, "news": desc}
 
+@app.get("/telegram/test")
+def telegram_test():
+    """Envia mensagem de teste pelo Telegram para verificar configuracao."""
+    ok = send_telegram("✅ <b>Bridge conectado ao Telegram!</b>\nTeste de notificacao do iqoption-bridge.")
+    return {
+        "sent": ok,
+        "configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
+    }
+
 @app.get("/analyze/{asset}/{duracao_seg}")
-def analyze(asset:str, duracao_seg:int):
+def analyze(asset: str, duracao_seg: int, auto_log: bool = Query(False, description="Se True, loga e notifica sinal automaticamente quando confluencia >= 4/8")):
     # --- Filtro #1: Killzone ICT ---
     kz_active, kz_zone = is_killzone_active()
     if not kz_active:
         logger.info(f"Bloqueado ({kz_zone}) — aguardando killzone")
-        return {
-            "blocked": True,
-            "reason": f"Fora de killzone: {kz_zone}",
-            "killzone": kz_zone
-        }
+        return {"blocked": True, "reason": f"Fora de killzone: {kz_zone}", "killzone": kz_zone}
     logger.info(f"Killzone ativa: {kz_zone}")
 
     # --- Filtro #2: News de alto impacto ---
     has_news, news_desc = has_high_impact_news()
     if has_news:
         logger.warning(f"NEWS BLOCK: {news_desc}")
-        return {
-            "blocked": True,
-            "reason": f"News de alto impacto: {news_desc}",
-            "killzone": kz_zone
-        }
+        return {"blocked": True, "reason": f"News de alto impacto: {news_desc}", "killzone": kz_zone}
 
     chk()
     try:
         raw = iq.get_candles(asset, duracao_seg, 100, time.time())
-        if not raw or len(raw)<15: raise HTTPException(404,"Dados insuficientes")
+        if not raw or len(raw) < 15: raise HTTPException(404, "Dados insuficientes")
         closes = [c["close"] for c in raw]
-        e9=calc_ema(closes,9); e21=calc_ema(closes,21); e50=calc_ema(closes,50)
-        lc=closes[-1]
-        trend = "alta" if e9 and e21 and e9>e21 and lc>e9 else "baixa" if e9 and e21 and e9<e21 and lc<e9 else "lateral"
-        last=raw[-1]
+        e9  = calc_ema(closes, 9)
+        e21 = calc_ema(closes, 21)
+        e50 = calc_ema(closes, 50)
+        lc  = closes[-1]
+        trend = ("alta"   if e9 and e21 and e9 > e21 and lc > e9 else
+                 "baixa"  if e9 and e21 and e9 < e21 and lc < e9 else "lateral")
+        last = raw[-1]
 
-        # --- Filtro #3: Volatilidade ATR (substitui volume OTC/proxy) ---
-        # --- Confluencia 4-de-8: padrao + volatilidade(ATR) obrigatorios + 2 de 6 opcionais ---
+        # --- Filtro #3: Volatilidade ATR ---
         vol_ok, atr_ratio = volatility_ok(raw)
-        if not vol_ok:
-            logger.info(f"Volatilidade insuficiente para {asset} (ATR ratio={atr_ratio})")
+        rsi14 = calc_rsi(closes)
+        boll  = calc_boll(closes)
+        padrao = detect_pattern(raw)
 
-        return {"asset":asset,"duracao_seg":duracao_seg,"preco_atual":lc,
-                "killzone": kz_zone,
-                "vela_atual":{"open":last["open"],"high":last["max"],"low":last["min"],"close":last["close"]},
-                "rsi14":calc_rsi(closes),"ema9":e9,"ema21":e21,"ema50":e50,
-                "bollinger":calc_boll(closes),"tendencia":trend,
-                "padrao_vela":detect_pattern(raw),
-                "volatilidade_atr":{"ok":vol_ok,"ratio":atr_ratio},
-                "blocked": False}
+        # --- Confluencia 4/8 ---
+        conf = calc_confluence(padrao, vol_ok, atr_ratio, rsi14, e9, e21, lc, boll, trend, kz_zone)
+
+        # Log e notificacao automatica (apenas se auto_log=True e confluencia valida)
+        signal_id  = None
+        sig_generated = False
+        if auto_log and conf["valid"]:
+            direction = conf["direction"]
+            exp_sec   = duracao_seg * 5   # 5 velas como expiracao padrao
+            sig = SignalLog(
+                asset=asset,
+                direction=direction,
+                expiration_sec=exp_sec,
+                entry_price=lc,
+                killzone=kz_zone,
+                atr_ratio=atr_ratio,
+                rsi=rsi14,
+                ema9=e9,
+                ema21=e21,
+                pattern=padrao,
+                confluence_score=conf["score"],
+                filters_matched=conf["filters_matched"],
+                account_type="PRACTICE",
+            )
+            entry = log_signal(sig)
+            signal_id     = entry["id"]
+            sig_generated = True
+
+            # Notificacao Telegram
+            emoji = "🟢" if direction == "CALL" else "🔴"
+            tg_msg = (
+                f"{emoji} <b>SINAL {asset.upper()}</b>\n"
+                f"📍 Direção: <b>{direction}</b>\n"
+                f"⏱ Expiração: {exp_sec}s ({exp_sec//60} min)\n"
+                f"💰 Entrada: {lc:.5f}\n"
+                f"📊 Confluência: {conf['score']}/8\n"
+                f"🔥 Killzone: {kz_zone}\n"
+                f"📈 Pattern: {padrao}\n"
+                f"📉 RSI: {rsi14}\n"
+                f"⚡ ATR ratio: {atr_ratio}x\n"
+                f"🆔 {signal_id[:8]}..."
+            )
+            threading.Thread(target=send_telegram, args=(tg_msg,), daemon=True).start()
+            logger.info(f"Sinal auto-logado: {signal_id} | {asset} {direction} | score {conf['score']}/8")
+
+        return {
+            "blocked": False,
+            "asset": asset,
+            "duracao_seg": duracao_seg,
+            "preco_atual": lc,
+            "killzone": kz_zone,
+            "vela_atual": {"open": last["open"], "high": last["max"], "low": last["min"], "close": last["close"]},
+            "rsi14": rsi14,
+            "ema9": e9, "ema21": e21, "ema50": e50,
+            "bollinger": boll,
+            "tendencia": trend,
+            "padrao_vela": padrao,
+            "volatilidade_atr": {"ok": vol_ok, "ratio": atr_ratio},
+            "confluencia": {
+                "valid": conf["valid"],
+                "score": conf["score"],
+                "direction": conf["direction"],
+                "filters_matched": conf["filters_matched"],
+            },
+            "signal_generated": sig_generated,
+            "signal_id": signal_id,
+        }
     except HTTPException: raise
-    except Exception as e: raise HTTPException(500,str(e))
+    except Exception as e: raise HTTPException(500, str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -520,9 +786,8 @@ def api_export():
 def api_stats(days: int = 30):
     """Win rate e metricas por dimensao (killzone, hora UTC, streaks)."""
     signals = read_all_signals()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff  = datetime.now(timezone.utc) - timedelta(days=days)
 
-    # Filtra so closed dentro do periodo
     closed = [
         s for s in signals
         if s["result"] in ("WIN", "LOSS", "DOE")
@@ -533,41 +798,31 @@ def api_stats(days: int = 30):
     wins   = sum(1 for s in closed if s["result"] == "WIN")
     losses = sum(1 for s in closed if s["result"] == "LOSS")
     does   = sum(1 for s in closed if s["result"] == "DOE")
-
     win_rate = (wins / total * 100) if total else 0.0
 
-    # Por killzone
     by_zone = {}
     for s in closed:
         zone = s.get("killzone") or "N/A"
         if zone not in by_zone:
             by_zone[zone] = {"total": 0, "wins": 0, "losses": 0}
         by_zone[zone]["total"] += 1
-        if s["result"] == "WIN":
-            by_zone[zone]["wins"] += 1
-        elif s["result"] == "LOSS":
-            by_zone[zone]["losses"] += 1
-    for zone, d in by_zone.items():
+        if s["result"] == "WIN":   by_zone[zone]["wins"]   += 1
+        elif s["result"] == "LOSS": by_zone[zone]["losses"] += 1
+    for d in by_zone.values():
         d["win_rate"] = round(d["wins"] / d["total"] * 100, 1) if d["total"] else 0
 
-    # Por hora UTC
     by_hour = {}
     for s in closed:
         hour = datetime.fromisoformat(s["created_at"].replace("Z", "+00:00")).hour
         if hour not in by_hour:
             by_hour[hour] = {"total": 0, "wins": 0}
         by_hour[hour]["total"] += 1
-        if s["result"] == "WIN":
-            by_hour[hour]["wins"] += 1
-    for h, d in by_hour.items():
+        if s["result"] == "WIN": by_hour[hour]["wins"] += 1
+    for d in by_hour.values():
         d["win_rate"] = round(d["wins"] / d["total"] * 100, 1) if d["total"] else 0
 
-    # Sequencias (streaks)
+    cur_loss = cur_win = max_win_streak = max_loss_streak = 0
     current_streak = {"type": None, "count": 0}
-    max_loss_streak = 0
-    max_win_streak  = 0
-    cur_loss = 0
-    cur_win  = 0
     for s in closed:
         if s["result"] == "WIN":
             cur_win += 1; cur_loss = 0
@@ -575,12 +830,9 @@ def api_stats(days: int = 30):
         elif s["result"] == "LOSS":
             cur_loss += 1; cur_win = 0
             max_loss_streak = max(max_loss_streak, cur_loss)
-    if cur_win > 0:
-        current_streak = {"type": "WIN",  "count": cur_win}
-    elif cur_loss > 0:
-        current_streak = {"type": "LOSS", "count": cur_loss}
+    if cur_win > 0:   current_streak = {"type": "WIN",  "count": cur_win}
+    elif cur_loss > 0: current_streak = {"type": "LOSS", "count": cur_loss}
 
-    # Pendentes expirados (nao atualizados)
     now = datetime.now(timezone.utc)
     pending_expired = [
         s for s in signals
@@ -591,9 +843,7 @@ def api_stats(days: int = 30):
     return {
         "period_days": days,
         "total_closed": total,
-        "wins": wins,
-        "losses": losses,
-        "does": does,
+        "wins": wins, "losses": losses, "does": does,
         "win_rate": round(win_rate, 2),
         "break_even_at_80_payout": 55.56,
         "above_break_even": win_rate > 55.56,
