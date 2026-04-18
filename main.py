@@ -124,6 +124,78 @@ def update_signal_result(res: SignalResult) -> dict:
 # Telegram
 # ---------------------------------------------------------------------------
 
+def resolve_signal(signal: dict):
+    """
+    Resolve um sinal PENDING comparando entry_price com preco do candle de expiracao.
+    Retorna o sinal atualizado ou None se nao conseguir resolver.
+    """
+    if signal.get("result") != "PENDING":
+        return None
+
+    try:
+        exp_time = datetime.fromisoformat(signal["expires_at"].replace("Z", "+00:00"))
+    except Exception as e:
+        logger.error(f"Erro parse expires_at: {e}")
+        return None
+
+    now = datetime.now(timezone.utc)
+    # So resolve se ja passou pelo menos 30s da expiracao (garantir candle fechado)
+    if now < exp_time + timedelta(seconds=30):
+        return None
+
+    if not connected:
+        return None  # Sem conexao IQ, tenta depois
+
+    asset     = signal["asset"]
+    direction = signal["direction"]
+    entry     = float(signal["entry_price"])
+
+    try:
+        # Pega os candles de 1min proximos da expiracao
+        raw = iq.get_candles(asset, 60, 3, exp_time.timestamp() + 60)
+        if not raw:
+            logger.warning(f"Sem candles para resolver {signal['id']}")
+            return None
+
+        # Pega o candle que contem o tempo de expiracao
+        exit_candle = None
+        exp_ts = exp_time.timestamp()
+        for c in raw:
+            if c["from"] <= exp_ts <= c["to"]:
+                exit_candle = c
+                break
+        if not exit_candle:
+            exit_candle = raw[-1]  # fallback
+
+        exit_price = float(exit_candle["close"])
+
+        # Calcula resultado
+        if abs(exit_price - entry) < 1e-8:
+            result = "DOE"
+            pnl    = 0.0
+        elif direction == "CALL":
+            result = "WIN" if exit_price > entry else "LOSS"
+            pnl    = ((exit_price - entry) / entry) * 100
+        elif direction == "PUT":
+            result = "WIN" if exit_price < entry else "LOSS"
+            pnl    = ((entry - exit_price) / entry) * 100
+        else:
+            logger.error(f"Direcao desconhecida: {direction}")
+            return None
+
+        signal["result"]      = result
+        signal["exit_price"]  = round(exit_price, 6)
+        signal["pnl_percent"] = round(pnl, 4)
+        signal["closed_at"]   = nowiso()
+        signal["notes"]       = "Auto-resolved by worker"
+
+        logger.info(f"Resolved {signal['id'][:8]}: {direction} {asset} entry={entry} exit={exit_price} -> {result}")
+        return signal
+    except Exception as e:
+        logger.error(f"Erro ao resolver {signal.get('id', 'unknown')}: {e}")
+        return None
+
+
 def send_telegram(text: str, parse_mode: str = "HTML") -> bool:
     """Envia mensagem via Telegram. Fail-open se env vars ausentes."""
     token   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -479,23 +551,22 @@ def monitor_worker():
                 alert_once("losses_3",
                            f"⚠️ <b>{loss_streak} losses seguidos</b>\nConsidere pausar e revisar.")
 
-            # 3. Pendentes expirados ha +5min → marca DOE automaticamente
-            now_dt = datetime.now(timezone.utc)
-            cutoff  = now_dt - timedelta(minutes=5)
-            updated = False
+            # 3. Pendentes expirados ha +30min sem resolucao -> marca DOE (unresolvable)
+            now_dt     = datetime.now(timezone.utc)
+            cutoff_doe = now_dt - timedelta(minutes=30)
+            updated    = False
             for s in signals:
                 if s["result"] == "PENDING":
-                    exp = datetime.fromisoformat(s["expires_at"].replace("Z","+00:00"))
-                    if exp < cutoff:
-                        s["result"]   = "DOE"
+                    exp = datetime.fromisoformat(s["expires_at"].replace("Z", "+00:00"))
+                    if exp < cutoff_doe:
+                        s["result"]    = "DOE"
                         s["closed_at"] = nowiso()
-                        s["notes"]    = "Auto-marked DOE (expired without result update)"
-                        updated = True
+                        s["notes"]     = "Unresolvable after 30min"
+                        updated        = True
             if updated:
                 with SIGNALS_FILE.open("w") as f:
                     for s in signals:
                         f.write(json.dumps(s) + "\n")
-                logger.warning("Sinais pendentes expirados marcados como DOE")
 
         except Exception as e:
             logger.error(f"Erro monitor_worker: {e}")
@@ -541,6 +612,61 @@ def daily_summary_worker():
             logger.error(f"Erro daily_summary_worker: {e}")
 
 threading.Thread(target=daily_summary_worker, daemon=True).start()
+
+
+def resolver_worker():
+    """Worker que varre sinais PENDING a cada 30s e resolve os expirados via IQ Option API."""
+    while True:
+        time.sleep(30)
+        try:
+            if not connected:
+                continue
+
+            signals = read_all_signals()
+            pending = [s for s in signals if s.get("result") == "PENDING"]
+            if not pending:
+                continue
+
+            resolved_count = 0
+            wins   = 0
+            losses = 0
+            for s in pending:
+                updated = resolve_signal(s)
+                if updated:
+                    for i, orig in enumerate(signals):
+                        if orig["id"] == updated["id"]:
+                            signals[i] = updated
+                            break
+                    resolved_count += 1
+                    if updated["result"] == "WIN":
+                        wins += 1
+                    elif updated["result"] == "LOSS":
+                        losses += 1
+
+                    # Notifica cada resultado via Telegram
+                    emoji     = "\U0001f7e2" if updated["result"] == "WIN" else ("\U0001f534" if updated["result"] == "LOSS" else "\U0001f7e1")
+                    dir_emoji = "\U0001f7e2" if updated["direction"] == "CALL" else "\U0001f534"
+                    msg = (
+                        f"{emoji} <b>{updated['result']}</b>\n\n"
+                        f"{dir_emoji} {updated['direction']} {updated['asset']}\n"
+                        f"\U0001f4b0 Entrada: {updated['entry_price']}\n"
+                        f"\U0001f4c8 Sa\u00edda: {updated['exit_price']}\n"
+                        f"\U0001f4ca PnL: {updated['pnl_percent']:+.3f}%\n"
+                        f"\U0001f525 Killzone: {updated.get('killzone', 'N/A')}\n"
+                        f"\U0001f194 {updated['id'][:8]}..."
+                    )
+                    send_telegram(msg)
+
+            if resolved_count > 0:
+                with SIGNALS_FILE.open("w") as f:
+                    for s in signals:
+                        f.write(json.dumps(s) + "\n")
+                logger.info(f"Resolver worker: {resolved_count} sinais resolvidos ({wins}W/{losses}L)")
+        except Exception as e:
+            logger.error(f"Erro resolver_worker: {e}")
+
+threading.Thread(target=resolver_worker, daemon=True).start()
+
 
 
 
@@ -804,6 +930,36 @@ def api_update_result(res: SignalResult):
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
+
+@app.post("/signals/resolve-pending")
+def api_resolve_pending():
+    """Forca a resolucao de todos os sinais PENDING expirados agora."""
+    chk()
+    signals = read_all_signals()
+    pending = [s for s in signals if s.get("result") == "PENDING"]
+    resolved = []
+    for s in pending:
+        updated = resolve_signal(s)
+        if updated:
+            for i, orig in enumerate(signals):
+                if orig["id"] == updated["id"]:
+                    signals[i] = updated
+                    break
+            resolved.append({
+                "id":          updated["id"],
+                "result":      updated["result"],
+                "pnl_percent": updated["pnl_percent"],
+            })
+    if resolved:
+        with SIGNALS_FILE.open("w") as f:
+            for s in signals:
+                f.write(json.dumps(s) + "\n")
+    return {
+        "resolved_count":    len(resolved),
+        "pending_remaining": len(pending) - len(resolved),
+        "resolved":          resolved,
+    }
+
 
 @app.get("/signals/recent")
 def api_recent(limit: int = 20):
