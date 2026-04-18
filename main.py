@@ -1,11 +1,17 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from iqoptionapi.api import IQOptionAPI
+from pydantic import BaseModel
+from typing import Optional
 import os, time, threading, logging
 import requests as req_lib
 from datetime import datetime, timedelta, timezone
 import pytz
 import pandas as pd
+import json
+import uuid
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +25,104 @@ iq: IQOptionAPI = None
 connected = False
 connect_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Arquivo de sinais (JSONL local)
+# ---------------------------------------------------------------------------
+
+SIGNALS_FILE = Path("signals.jsonl")
+
+
+def nowiso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# ---------------------------------------------------------------------------
+# Modelos Pydantic
+# ---------------------------------------------------------------------------
+
+class SignalLog(BaseModel):
+    asset: str
+    direction: str               # CALL ou PUT
+    expiration_sec: int
+    entry_price: float
+    killzone: Optional[str] = None
+    news_block: bool = False
+    atr_ratio: Optional[float] = None
+    rsi: Optional[float] = None
+    ema9: Optional[float] = None
+    ema21: Optional[float] = None
+    pattern: Optional[str] = None
+    confluence_score: Optional[int] = None
+    filters_matched: Optional[dict] = None
+    account_type: str = "PRACTICE"
+    notes: Optional[str] = None
+
+
+class SignalResult(BaseModel):
+    signal_id: str
+    result: str                  # WIN, LOSS ou DOE
+    exit_price: float
+    pnl_percent: Optional[float] = None
+
+
+# ---------------------------------------------------------------------------
+# Funcoes de persistencia JSONL
+# ---------------------------------------------------------------------------
+
+def log_signal(sig: SignalLog) -> dict:
+    entry = {
+        "id": str(uuid.uuid4()),
+        "created_at": nowiso(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=sig.expiration_sec)).isoformat().replace("+00:00", "Z"),
+        "result": "PENDING",
+        "exit_price": None,
+        "pnl_percent": None,
+        **sig.dict()
+    }
+    with SIGNALS_FILE.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+    logger.info(f"Sinal registrado: {entry['id']} | {entry['asset']} {entry['direction']}")
+    return entry
+
+
+def read_all_signals() -> list:
+    if not SIGNALS_FILE.exists():
+        return []
+    out = []
+    with SIGNALS_FILE.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+    return out
+
+
+def update_signal_result(res: SignalResult) -> dict:
+    signals = read_all_signals()
+    updated = None
+    for s in signals:
+        if s["id"] == res.signal_id:
+            s["result"] = res.result
+            s["exit_price"] = res.exit_price
+            s["pnl_percent"] = res.pnl_percent
+            s["closed_at"] = nowiso()
+            updated = s
+            break
+    if not updated:
+        raise HTTPException(404, f"Signal {res.signal_id} nao encontrado")
+    with SIGNALS_FILE.open("w") as f:
+        for s in signals:
+            f.write(json.dumps(s) + "\n")
+    logger.info(f"Resultado atualizado: {res.signal_id} -> {res.result}")
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# IQ Option — conexao
+# ---------------------------------------------------------------------------
 
 def do_connect():
     global iq, connected
@@ -240,8 +344,22 @@ def volatility_ok(raw: list, multiplier: float = 1.2, period: int = 14) -> tuple
 
 @app.get("/")
 def root():
-    return {"service":"IQ Option Bridge v2","connected":connected,"account":"PRACTICE",
-            "endpoints":["/health","/balance","/candles/{asset}/{dur}/{qtd}","/price/{asset}","/payout/{asset}","/analyze/{asset}/{dur}","/assets/open","/killzone","/news-check"]}
+    return {
+        "service": "IQ Option Bridge API v2",
+        "connected": connected,
+        "account": "PRACTICE",
+        "endpoints": [
+            "/health", "/balance",
+            "/candles/{asset}/{dur}/{qtd}",
+            "/price/{asset}", "/payout/{asset}",
+            "/analyze/{asset}/{dur}",
+            "/assets/open",
+            "/killzone", "/news-check",
+            "/signal/log", "/signal/result",
+            "/signals/recent", "/signals/export",
+            "/stats"
+        ]
+    }
 
 @app.get("/health")
 def health():
@@ -360,3 +478,130 @@ def analyze(asset:str, duracao_seg:int):
                 "blocked": False}
     except HTTPException: raise
     except Exception as e: raise HTTPException(500,str(e))
+
+
+# ---------------------------------------------------------------------------
+# Endpoints de Logger de Sinais
+# ---------------------------------------------------------------------------
+
+@app.post("/signal/log")
+def api_log_signal(sig: SignalLog):
+    """Registra um novo sinal operado no arquivo JSONL local."""
+    try:
+        return log_signal(sig)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/signal/result")
+def api_update_result(res: SignalResult):
+    """Atualiza o resultado (WIN/LOSS/DOE) de um sinal apos expiracao."""
+    try:
+        return update_signal_result(res)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/signals/recent")
+def api_recent(limit: int = 20):
+    """Retorna os ultimos N sinais registrados (mais recente primeiro)."""
+    signals = read_all_signals()
+    return {"total": len(signals), "signals": signals[-limit:][::-1]}
+
+@app.get("/signals/export")
+def api_export():
+    """Retorna conteudo bruto do JSONL para backup."""
+    if not SIGNALS_FILE.exists():
+        return {"content": "", "lines": 0}
+    content = SIGNALS_FILE.read_text()
+    return {"content": content, "lines": len([l for l in content.split("\n") if l.strip()])}
+
+@app.get("/stats")
+def api_stats(days: int = 30):
+    """Win rate e metricas por dimensao (killzone, hora UTC, streaks)."""
+    signals = read_all_signals()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    # Filtra so closed dentro do periodo
+    closed = [
+        s for s in signals
+        if s["result"] in ("WIN", "LOSS", "DOE")
+        and datetime.fromisoformat(s["created_at"].replace("Z", "+00:00")) >= cutoff
+    ]
+
+    total  = len(closed)
+    wins   = sum(1 for s in closed if s["result"] == "WIN")
+    losses = sum(1 for s in closed if s["result"] == "LOSS")
+    does   = sum(1 for s in closed if s["result"] == "DOE")
+
+    win_rate = (wins / total * 100) if total else 0.0
+
+    # Por killzone
+    by_zone = {}
+    for s in closed:
+        zone = s.get("killzone") or "N/A"
+        if zone not in by_zone:
+            by_zone[zone] = {"total": 0, "wins": 0, "losses": 0}
+        by_zone[zone]["total"] += 1
+        if s["result"] == "WIN":
+            by_zone[zone]["wins"] += 1
+        elif s["result"] == "LOSS":
+            by_zone[zone]["losses"] += 1
+    for zone, d in by_zone.items():
+        d["win_rate"] = round(d["wins"] / d["total"] * 100, 1) if d["total"] else 0
+
+    # Por hora UTC
+    by_hour = {}
+    for s in closed:
+        hour = datetime.fromisoformat(s["created_at"].replace("Z", "+00:00")).hour
+        if hour not in by_hour:
+            by_hour[hour] = {"total": 0, "wins": 0}
+        by_hour[hour]["total"] += 1
+        if s["result"] == "WIN":
+            by_hour[hour]["wins"] += 1
+    for h, d in by_hour.items():
+        d["win_rate"] = round(d["wins"] / d["total"] * 100, 1) if d["total"] else 0
+
+    # Sequencias (streaks)
+    current_streak = {"type": None, "count": 0}
+    max_loss_streak = 0
+    max_win_streak  = 0
+    cur_loss = 0
+    cur_win  = 0
+    for s in closed:
+        if s["result"] == "WIN":
+            cur_win += 1; cur_loss = 0
+            max_win_streak = max(max_win_streak, cur_win)
+        elif s["result"] == "LOSS":
+            cur_loss += 1; cur_win = 0
+            max_loss_streak = max(max_loss_streak, cur_loss)
+    if cur_win > 0:
+        current_streak = {"type": "WIN",  "count": cur_win}
+    elif cur_loss > 0:
+        current_streak = {"type": "LOSS", "count": cur_loss}
+
+    # Pendentes expirados (nao atualizados)
+    now = datetime.now(timezone.utc)
+    pending_expired = [
+        s for s in signals
+        if s["result"] == "PENDING"
+        and datetime.fromisoformat(s["expires_at"].replace("Z", "+00:00")) < now
+    ]
+
+    return {
+        "period_days": days,
+        "total_closed": total,
+        "wins": wins,
+        "losses": losses,
+        "does": does,
+        "win_rate": round(win_rate, 2),
+        "break_even_at_80_payout": 55.56,
+        "above_break_even": win_rate > 55.56,
+        "current_streak": current_streak,
+        "max_win_streak": max_win_streak,
+        "max_loss_streak": max_loss_streak,
+        "by_killzone": by_zone,
+        "by_hour_utc": by_hour,
+        "pending_expired_count": len(pending_expired),
+        "total_signals_all_time": len(signals),
+    }
