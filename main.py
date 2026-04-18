@@ -126,30 +126,39 @@ def update_signal_result(res: SignalResult) -> dict:
 
 def send_telegram(text: str, parse_mode: str = "HTML") -> bool:
     """Envia mensagem via Telegram. Fail-open se env vars ausentes."""
-    token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    token   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         logger.warning("Telegram nao configurado (faltam TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
         return False
-    try:
-        url  = f"https://api.telegram.org/bot{token}/sendMessage"
-        resp = req_lib.post(url, json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }, timeout=5)
-        return resp.status_code == 200
-    except Exception as e:
-        logger.error(f"Erro Telegram: {e}")
-        return False
 
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
 
-# ---------------------------------------------------------------------------
-# Alertas com cooldown (nao repetir o mesmo alerta em menos de N segundos)
-# ---------------------------------------------------------------------------
+    # Retry com backoff: 15s, 20s, 30s
+    timeouts = [15, 20, 30]
+    for attempt, timeout in enumerate(timeouts, 1):
+        try:
+            resp = req_lib.post(url, json=payload, timeout=timeout)
+            if resp.status_code == 200:
+                if attempt > 1:
+                    logger.info(f"Telegram OK na tentativa {attempt}")
+                return True
+            else:
+                logger.warning(f"Telegram retornou {resp.status_code} (tentativa {attempt}): {resp.text[:200]}")
+        except req_lib.exceptions.Timeout:
+            logger.warning(f"Telegram timeout ({timeout}s) na tentativa {attempt}/{len(timeouts)}")
+        except Exception as e:
+            logger.error(f"Erro Telegram tentativa {attempt}: {e}")
+            break  # Erros nao-timeout: nao tenta de novo
 
-_alert_cooldown: dict = {}   # {alert_key: timestamp_ultimo_envio}
+    logger.error("Telegram falhou apos todas as tentativas")
+    return False
 
 
 def alert_once(key: str, message: str, cooldown_sec: int = 3600) -> bool:
@@ -634,12 +643,40 @@ def news_check():
 
 @app.get("/telegram/test")
 def telegram_test():
-    """Envia mensagem de teste pelo Telegram para verificar configuracao."""
-    ok = send_telegram("✅ <b>Bridge conectado ao Telegram!</b>\nTeste de notificacao do iqoption-bridge.")
-    return {
-        "sent": ok,
-        "configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
+    """Testa conectividade com Telegram API e envia mensagem de teste."""
+    import time as _time
+    token_set = bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip())
+    chat_set  = bool(os.getenv("TELEGRAM_CHAT_ID", "").strip())
+
+    result = {
+        "configured": token_set and chat_set,
+        "token_set": token_set,
+        "chat_id_set": chat_set,
     }
+
+    if not (token_set and chat_set):
+        result["sent"] = False
+        result["error"] = "Variaveis de ambiente faltando"
+        return result
+
+    # Testa conectividade com Telegram API antes de enviar
+    try:
+        start = _time.time()
+        token = os.getenv("TELEGRAM_BOT_TOKEN").strip()
+        check_url = f"https://api.telegram.org/bot{token}/getMe"
+        resp = req_lib.get(check_url, timeout=15)
+        result["api_reachable"] = resp.status_code == 200
+        result["api_latency_ms"] = int((_time.time() - start) * 1000)
+        if resp.status_code == 200:
+            result["bot_info"] = resp.json().get("result", {}).get("username")
+    except Exception as e:
+        result["api_reachable"] = False
+        result["api_error"] = str(e)
+
+    # Tenta enviar
+    ok = send_telegram("\u2705 <b>Bridge conectado ao Telegram!</b>\nTeste de notificacao do iqoption-bridge.")
+    result["sent"] = ok
+    return result
 
 @app.get("/analyze/{asset}/{duracao_seg}")
 def analyze(asset: str, duracao_seg: int, auto_log: bool = Query(False, description="Se True, loga e notifica sinal automaticamente quando confluencia >= 4/8")):
