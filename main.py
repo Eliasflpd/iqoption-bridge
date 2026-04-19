@@ -10,7 +10,7 @@ import pytz
 import pandas as pd
 import json
 import uuid
-from pathlib import Path
+from pathlib import Pathh
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -124,7 +124,7 @@ def update_signal_result(res: SignalResult) -> dict:
 # Telegram
 # ---------------------------------------------------------------------------
 
-def resolve_signal(signal: dict):
+def resolve_signal(signal: dict) -> dict | None:
     """
     Resolve um sinal PENDING comparando entry_price com preco do candle de expiracao.
     Retorna o sinal atualizado ou None se nao conseguir resolver.
@@ -691,6 +691,7 @@ def root():
             "/killzone", "/news-check",
             "/telegram/test",
             "/signal/log", "/signal/result",
+            "/signals/resolve-pending",
             "/signals/recent", "/signals/export",
             "/stats"
         ]
